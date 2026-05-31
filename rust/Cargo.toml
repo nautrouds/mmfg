@@ -1,0 +1,19 @@
+[package]
+name = "mmfg"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["node"]
+node = []
+
+[[bin]]
+name = "node"
+path = "src/node/main.rs"
+required-features = ["node"]
+
+[dependencies]
+memmap2 = "0.9.10"
+libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
