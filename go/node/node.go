@@ -1,0 +1,386 @@
+//go:build unix
+
+package node
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"os"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/nautrouds/mmfg/go/shm"
+	mmfg_sync "github.com/nautrouds/mmfg/go/sync"
+	"github.com/nautrouds/mmfg/internal/netutil"
+)
+
+type Connection interface {
+	io.Reader
+	io.Writer
+	io.ReaderAt
+	io.WriterAt
+	DataLen() uint32
+	RequestExpand() error
+	OnExpandComplete()
+}
+
+type Handler func(conn Connection)
+
+type Node struct {
+	nodeID  int
+	ctrl    *shm.Control
+	nodeEv  *mmfg_sync.Eventfd
+	hubEv   *mmfg_sync.Eventfd
+	chunks  []*shm.Chunk
+	handler Handler
+	mu      sync.RWMutex
+	waiters map[uint32]chan bool
+	wMu     sync.Mutex
+}
+
+type NodeOption func(*Node)
+
+func WithHandler(handler Handler) NodeOption {
+	return func(n *Node) {
+		n.handler = handler
+	}
+}
+
+func NewNode(opts ...NodeOption) *Node {
+	n := &Node{
+		chunks:  make([]*shm.Chunk, 0),
+		waiters: make(map[uint32]chan bool),
+	}
+	for _, opt := range opts {
+		opt(n)
+	}
+	return n
+}
+
+func (n *Node) Listen(socketPath string) error {
+	os.Remove(socketPath)
+	l, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return err
+	}
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			continue
+		}
+		go n.handleHub(conn)
+	}
+}
+
+func (n *Node) handleHub(conn net.Conn) {
+	defer conn.Close()
+	// 1. Handshake
+	header := make([]byte, 7)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return
+	}
+
+	if !bytes.Equal(header[:4], mmfg_sync.CONN_HEADER) {
+		log.Printf("Invalid handshake header: %s", string(header[:4]))
+		return
+	}
+
+	if header[4] != mmfg_sync.CONN_VERSION {
+		log.Printf("Unsupported version: %d", header[4])
+		return
+	}
+
+	nodeID := int(header[6])
+
+	fds, err := netutil.ReceiveFDs(conn, 3)
+	if err != nil {
+		return
+	}
+
+	chunk0, err := shm.AttachChunk(fds[0])
+	if err != nil {
+		return
+	}
+	// Close FD immediately after mmap for Nodes
+	syscall.Close(fds[0])
+	chunk0.Fd = -1
+
+	blkCnt := shm.ControlStripeSize / shm.BlockSize
+
+	controlStripe := &shm.Stripe{
+		BlockCount: blkCnt,
+		Blocks:     make([][]byte, blkCnt),
+	}
+
+	for i := range blkCnt {
+		offset := i * shm.BlockSize
+		controlStripe.Blocks[i] = chunk0.Data[offset : offset+shm.BlockSize]
+	}
+
+	n.mu.Lock()
+	n.nodeID = nodeID
+	n.ctrl = shm.NewControl(controlStripe)
+	n.nodeEv = mmfg_sync.AttachEventfd(fds[1])
+	n.hubEv = mmfg_sync.AttachEventfd(fds[2])
+	n.chunks = append(n.chunks, chunk0)
+	n.mu.Unlock()
+
+	go n.StartEventLoop()
+
+	for {
+		msgHeader := make([]byte, 1)
+		if _, err := io.ReadFull(conn, msgHeader); err != nil {
+			break
+		}
+
+		msgType := netutil.MsgType(msgHeader[0])
+		switch msgType {
+		case netutil.MsgNewChunk:
+			chunkFDs, err := netutil.ReceiveFDs(conn, 1)
+			if err != nil {
+				continue
+			}
+			chunk, err := shm.AttachChunk(chunkFDs[0])
+			if err != nil {
+				continue
+			}
+			syscall.Close(chunkFDs[0])
+			chunk.Fd = -1
+			n.mu.Lock()
+			n.chunks = append(n.chunks, chunk)
+			n.mu.Unlock()
+
+		case netutil.MsgRelease:
+			// ACK or Stop
+		}
+	}
+
+	// Cleanup on Hub disconnection
+	n.mu.Lock()
+	for _, c := range n.chunks {
+		c.Close()
+	}
+	n.chunks = nil
+	if n.nodeEv != nil {
+		n.nodeEv.Close()
+	}
+	if n.hubEv != nil {
+		n.hubEv.Close()
+	}
+	n.mu.Unlock()
+}
+
+func (n *Node) processSlot(slotID uint32) {
+	cid, off := n.ctrl.GetStripeHeader(slotID)
+
+	headerChunk := n.getChunk(cid)
+	offset := int(off) * shm.BlockSize
+	headerBlk := headerChunk.Data[offset : offset+shm.BlockSize]
+
+	dataLen, blkCnt, seq := shm.DecodeHeader(headerBlk)
+	stripe := &shm.Stripe{
+		DataLen:    dataLen,
+		Sequence:   seq,
+		BlockCount: blkCnt,
+		Blocks:     make([][]byte, 0, blkCnt),
+	}
+
+	chunkID := int16(cid)
+	for _, id := range stripe.Sequence {
+		if id < 0 {
+			chunkID = id
+			continue
+		}
+		chunk := n.getChunk(chunkID)
+		off := int(id) * shm.BlockSize
+		stripe.Blocks = append(stripe.Blocks, chunk.Data[off:off+shm.BlockSize])
+	}
+
+	conn := &nodeConn{
+		node:   n,
+		slotID: slotID,
+		stripe: stripe,
+	}
+
+	if n.handler != nil {
+		n.handler(conn)
+	}
+
+	if conn.failed {
+		return
+	}
+
+	n.ctrl.SetStripeStatus(slotID, shm.StripeStatusDone)
+
+	respQOff := shm.GetNodeReqQueueOffset(0)
+	if n.ctrl.Push(respQOff, slotID, shm.CMD_PROCESS) {
+		n.hubEv.Notify()
+	} else {
+		fmt.Printf("Node %d: FAILED to push Slot %d to RespQueue\n", n.nodeID, slotID)
+	}
+}
+
+type nodeConn struct {
+	node   *Node
+	stripe *shm.Stripe
+
+	readOff  int64
+	writeOff int64
+
+	slotID uint32
+
+	failed bool
+}
+
+func (c *nodeConn) DataLen() uint32 {
+	return c.stripe.DataLen
+}
+
+func (c *nodeConn) RequestExpand() error {
+	ch := make(chan bool)
+	c.node.wMu.Lock()
+	c.node.waiters[c.slotID] = ch
+	c.node.wMu.Unlock()
+
+	// Hub's Command queue (using 0 for hub)
+	respQOff := uintptr(shm.OFF_RESP_QUEUE)
+	if !c.node.ctrl.Push(respQOff, c.slotID, shm.CMD_REQUEST_EXPAND) {
+		return fmt.Errorf("failed to push expand request")
+	}
+	c.node.hubEv.Notify()
+	ok := <-ch
+	close(ch)
+	if !ok {
+		c.failed = true
+		return fmt.Errorf("failed to expand stripe")
+	}
+	return nil
+}
+
+func (c *nodeConn) OnExpandComplete() {
+	cid, off := c.node.ctrl.GetStripeHeader(c.slotID)
+	headerChunk := c.node.getChunk(cid)
+	offset := int(off) * shm.BlockSize
+	headerData := headerChunk.Data[offset : offset+shm.BlockSize]
+	_, _, newSequence := shm.DecodeHeader(headerData)
+
+	l := len(c.stripe.Sequence)
+
+	var lastChunkID int16
+	for i, id := range newSequence {
+		if id < 0 {
+			lastChunkID = id
+			continue
+		}
+		if i < l {
+			continue
+		}
+		chunk := c.node.getChunk(lastChunkID)
+		off := int(id) * shm.BlockSize
+		block := chunk.Data[off : off+shm.BlockSize]
+		c.stripe.Blocks = append(c.stripe.Blocks, block)
+	}
+	c.stripe.Sequence = newSequence
+}
+
+func (n *Node) getChunk(cid int16) *shm.Chunk {
+	if cid >= 0 {
+		log.Printf("CID: %d\n", cid)
+	}
+	realCID := int(^cid)
+	for {
+		n.mu.RLock()
+		if realCID < len(n.chunks) {
+			chunk := n.chunks[realCID]
+			n.mu.RUnlock()
+			return chunk
+		}
+		n.mu.RUnlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (c *nodeConn) Read(p []byte) (int, error) {
+	n, err := c.stripe.ReadAt(p, c.readOff)
+	if err != nil {
+		return n, err
+	}
+
+	c.readOff += int64(n)
+	return n, err
+}
+
+func (c *nodeConn) ReadAt(p []byte, off int64) (int, error) {
+	return c.stripe.ReadAt(p, off)
+}
+
+func (c *nodeConn) Write(p []byte) (int, error) {
+	n, err := c.WriteAt(p, c.writeOff)
+	if err != nil {
+		return 0, err
+	}
+	c.writeOff += int64(n)
+	return n, err
+}
+
+func (c *nodeConn) WriteAt(p []byte, off int64) (int, error) {
+	totalCap := c.stripe.BlockCount * shm.BlockSize
+	needCap := int(off) + len(p)
+	userCap := totalCap - shm.BlockSize
+	if needCap > shm.StripeDataSizeLimit {
+		return 0, fmt.Errorf("stripe block count limit reached, cannot expand further")
+	}
+	for needCap > userCap {
+		if err := c.RequestExpand(); err != nil {
+			return 0, err
+		}
+		c.OnExpandComplete()
+		totalCap = c.stripe.BlockCount * shm.BlockSize
+		userCap = totalCap - shm.BlockSize
+	}
+
+	return c.stripe.WriteAt(p, off)
+}
+
+func (n *Node) StartEventLoop() {
+	reqQOff := shm.GetNodeReqQueueOffset(n.nodeID)
+
+	for {
+		err := n.nodeEv.Wait()
+		if err != nil {
+			fmt.Printf("Node %d: Event Loop stopping: %v\n", n.nodeID, err)
+			return
+		}
+		for {
+			slotID, cmd, ok := n.ctrl.Pop(reqQOff)
+			if !ok {
+				break
+			}
+			switch cmd {
+			case shm.CMD_PROCESS:
+				go n.processSlot(slotID)
+			case shm.CMD_RELEASE:
+				n.ctrl.FreeSlot(slotID)
+			case shm.CMD_EXPAND_READY:
+				n.wMu.Lock()
+				if ch, ok := n.waiters[slotID]; ok {
+					ch <- true
+					delete(n.waiters, slotID)
+				}
+				n.wMu.Unlock()
+			case shm.CMD_EXPAND_ERROR:
+				n.wMu.Lock()
+				if ch, ok := n.waiters[slotID]; ok {
+					ch <- false
+					delete(n.waiters, slotID)
+				}
+				n.wMu.Unlock()
+			}
+		}
+	}
+}
