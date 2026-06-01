@@ -3,8 +3,10 @@
 package shm
 
 import (
+	"bytes"
 	"errors"
 	"io"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 )
@@ -120,4 +122,183 @@ func (s *Stripe) WriteAt(p []byte, off int64) (n int, err error) {
 	}
 
 	return n, nil
+}
+
+type Viewer struct {
+	Segments [][]byte
+	offsets  []int
+	Length   int
+}
+
+func (v *Viewer) findSegment(offset int) (int, int) {
+	idx, _ := slices.BinarySearch(v.offsets, offset)
+	if idx > 0 && (idx == len(v.offsets) || v.offsets[idx] > offset) {
+		idx--
+	}
+	return idx, offset - v.offsets[idx]
+}
+
+func (v *Viewer) ByteAt(offset int) (byte, error) {
+	if offset < 0 || offset >= v.Length {
+		return 0, errors.New("out of bounds")
+	}
+
+	idx, innerOff := v.findSegment(offset)
+	return v.Segments[idx][innerOff], nil
+}
+
+func (v *Viewer) SetByteAt(offset int, val byte) error {
+	if offset < 0 || offset >= v.Length {
+		return errors.New("out of bounds")
+	}
+
+	idx, innerOff := v.findSegment(offset)
+	v.Segments[idx][innerOff] = val
+	return nil
+}
+
+func (v *Viewer) Iterator() func() (byte, bool) {
+	segIdx := 0
+	innerIdx := 0
+
+	return func() (byte, bool) {
+		for segIdx < len(v.Segments) {
+			if innerIdx < len(v.Segments[segIdx]) {
+				val := v.Segments[segIdx][innerIdx]
+				innerIdx++
+				return val, true
+			}
+			segIdx++
+			innerIdx = 0
+		}
+		return 0, false
+	}
+}
+
+func (v *Viewer) Compare(data []byte) bool {
+	if len(data) != v.Length {
+		return false
+	}
+
+	for i, seg := range v.Segments {
+		start := v.offsets[i]
+		if !bytes.Equal(seg, data[start:start+len(seg)]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (v *Viewer) Index(s string) int {
+	if len(s) == 0 {
+		return 0
+	}
+
+	target := unsafe.Slice(unsafe.StringData(s), len(s))
+
+	targetLen := len(target)
+	firstByte := target[0]
+
+	for i, seg := range v.Segments {
+		currentOff := v.offsets[i]
+		segLen := len(seg)
+
+		for startIdx := 0; startIdx < segLen; {
+			matchPos := bytes.IndexByte(seg[startIdx:], firstByte)
+			if matchPos == -1 {
+				break
+			}
+
+			absMatchPos := startIdx + matchPos
+			startIdx = absMatchPos + 1
+
+			if absMatchPos+targetLen <= segLen {
+				if bytes.Equal(seg[absMatchPos:absMatchPos+targetLen], target) {
+					return currentOff + absMatchPos
+				}
+			} else {
+				if v.matchAcrossSegments(i, absMatchPos, target) {
+					return currentOff + absMatchPos
+				}
+			}
+		}
+	}
+
+	return -1
+}
+
+func (v *Viewer) matchAcrossSegments(segIdx, posInSeg int, target []byte) bool {
+	targetLen := len(target)
+	currSegIdx := segIdx
+	currOff := posInSeg
+
+	for i := 0; i < targetLen; i++ {
+		if currOff >= len(v.Segments[currSegIdx]) {
+			currSegIdx++
+			currOff = 0
+			if currSegIdx >= len(v.Segments) {
+				return false
+			}
+		}
+
+		if v.Segments[currSegIdx][currOff] != target[i] {
+			return false
+		}
+		currOff++
+	}
+	return true
+}
+
+func (s *Stripe) View(offset, length int, call func(*Viewer) error) error {
+	if offset < 0 {
+		return errors.New("negative offset")
+	}
+
+	if offset >= int(s.DataLen) {
+		return io.EOF
+	}
+
+	n := min(uint32(offset+length), s.DataLen)
+	actualLen := int(n) - offset
+
+	if actualLen <= 0 {
+		return io.EOF
+	}
+
+	startOff := int64(offset) + BlockSize
+	endOff := int64(n) + BlockSize
+
+	var segments [][]byte
+
+	for off := startOff; off < endOff; {
+		bIdx := off / int64(BlockSize)
+		if bIdx >= int64(len(s.Blocks)) {
+			break
+		}
+
+		innerOff := off % int64(BlockSize)
+		avail := int64(BlockSize) - innerOff
+		copyLen := avail
+		if off+copyLen > endOff {
+			copyLen = endOff - off
+		}
+
+		segments = append(segments, s.Blocks[bIdx][innerOff:innerOff+copyLen])
+
+		off += copyLen
+	}
+
+	viewer := &Viewer{
+		Segments: segments,
+		offsets:  make([]int, len(segments)),
+		Length:   actualLen,
+	}
+
+	curr := 0
+	for i, seg := range segments {
+		viewer.offsets[i] = curr
+		curr += len(seg)
+	}
+
+	return call(viewer)
 }
