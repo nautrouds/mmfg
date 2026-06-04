@@ -99,12 +99,12 @@ func (s *Stripe) WriteAt(p []byte, off int64) (n int, err error) {
 
 	remaining := len(p)
 	for remaining > 0 {
-		bIdx := off / int64(BlockSize)
+		bIdx := off / BlockSize
 		if bIdx >= int64(len(s.Blocks)) {
 			return n, errors.New("stripe capacity exceeded")
 		}
-		innerOff := off % int64(BlockSize)
-		avail := int64(BlockSize) - innerOff
+		innerOff := off % BlockSize
+		avail := BlockSize - innerOff
 		copyLen := int(avail)
 		if copyLen > remaining {
 			copyLen = remaining
@@ -271,12 +271,12 @@ func (s *Stripe) View(offset, length int, call func(*Viewer) error) error {
 	var segments [][]byte
 
 	for off := startOff; off < endOff; {
-		bIdx := off / int64(BlockSize)
+		bIdx := off / BlockSize
 		if bIdx >= int64(len(s.Blocks)) {
 			break
 		}
 
-		innerOff := off % int64(BlockSize)
+		innerOff := off % BlockSize
 		avail := int64(BlockSize) - innerOff
 		copyLen := avail
 		if off+copyLen > endOff {

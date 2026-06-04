@@ -6,12 +6,6 @@ import (
 	"encoding/binary"
 )
 
-// BlockInfo is a lightweight reference to a physical block.
-type BlockInfo struct {
-	ChunkID  int16
-	BlockIdx int16
-}
-
 func UpdateStripeHeader(stripe *Stripe) {
 	headerData := stripe.Blocks[0]
 	binary.LittleEndian.PutUint32(headerData[HEADER_DATA_LEN_OFF:], stripe.DataLen)
