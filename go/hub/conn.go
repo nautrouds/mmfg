@@ -45,6 +45,8 @@ type Connection interface {
 	io.Reader
 	io.WriterAt
 	io.ReaderAt
+	io.ByteReader
+	io.ByteWriter
 	DataLen() uint32
 	Next(nodeName string) error
 	WriteTo(w io.Writer) (int64, error)
@@ -85,6 +87,17 @@ func (c *busConn) ensureCapacity(needed int) error {
 	return nil
 }
 
+func (c *busConn) WriteByte(b byte) error {
+	if err := c.ensureCapacity(int(c.writeOff) + 1); err != nil {
+		return err
+	}
+	err := c.Stripe.WriteByteAt(b, c.writeOff)
+	if err == nil {
+		c.writeOff++
+	}
+	return err
+}
+
 func (c *busConn) Write(data []byte) (int, error) {
 	n, err := c.WriteAt(data, c.writeOff)
 	if err != nil {
@@ -105,6 +118,14 @@ func (c *busConn) WriteAt(data []byte, off int64) (int, error) {
 	}
 
 	return n, nil
+}
+
+func (c *busConn) ReadByte() (byte, error) {
+	b, err := c.Stripe.ReadByteAt(c.readOff)
+	if err == nil {
+		c.readOff++
+	}
+	return b, err
 }
 
 func (c *busConn) Read(data []byte) (int, error) {

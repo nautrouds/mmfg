@@ -23,6 +23,8 @@ type Connection interface {
 	io.Writer
 	io.ReaderAt
 	io.WriterAt
+	io.ByteReader
+	io.ByteWriter
 	DataLen() uint32
 	RequestExpand() error
 	OnExpandComplete()
@@ -305,6 +307,14 @@ func (n *Node) getChunk(cid int16) *shm.Chunk {
 	}
 }
 
+func (c *nodeConn) ReadByte() (byte, error) {
+	b, err := c.stripe.ReadByteAt(c.readOff)
+	if err == nil {
+		c.readOff++
+	}
+	return b, err
+}
+
 func (c *nodeConn) Read(p []byte) (int, error) {
 	n, err := c.stripe.ReadAt(p, c.readOff)
 	if err != nil {
@@ -317,6 +327,25 @@ func (c *nodeConn) Read(p []byte) (int, error) {
 
 func (c *nodeConn) ReadAt(p []byte, off int64) (int, error) {
 	return c.stripe.ReadAt(p, off)
+}
+
+func (c *nodeConn) WriteByte(b byte) error {
+	totalCap := c.stripe.BlockCount * shm.BlockSize
+	needCap := int(c.writeOff) + 1
+	userCap := totalCap - shm.BlockSize
+	if needCap > shm.StripeDataSizeLimit {
+		return fmt.Errorf("stripe block count limit reached, cannot expand further")
+	}
+	for needCap > userCap {
+		if err := c.RequestExpand(); err != nil {
+			return err
+		}
+		c.OnExpandComplete()
+		totalCap = c.stripe.BlockCount * shm.BlockSize
+		userCap = totalCap - shm.BlockSize
+	}
+
+	return c.stripe.WriteByteAt(b, c.writeOff)
 }
 
 func (c *nodeConn) Write(p []byte) (int, error) {

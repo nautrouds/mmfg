@@ -89,6 +89,22 @@ func (s *Stripe) ReadAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
+func (s *Stripe) ReadByteAt(off int64) (byte, error) {
+	if off < 0 || off >= int64(s.DataLen) {
+		if off < 0 {
+			return 0, errors.New("negative offset")
+		}
+		return 0, io.EOF
+	}
+
+	bIdx := off / BlockSize
+	if bIdx >= int64(len(s.Blocks)) {
+		return 0, io.EOF
+	}
+	innerOff := off % BlockSize
+	return s.Blocks[bIdx][innerOff], nil
+}
+
 // WriteAt implements io.WriterAt for a Stripe.
 func (s *Stripe) WriteAt(p []byte, off int64) (n int, err error) {
 	if off < 0 {
@@ -125,6 +141,28 @@ func (s *Stripe) WriteAt(p []byte, off int64) (n int, err error) {
 	}
 
 	return n, nil
+}
+
+func (s *Stripe) WriteByteAt(b byte, off int64) error {
+	if off < 0 {
+		return errors.New("negative offset")
+	}
+
+	off += BlockSize
+
+	bIdxInt := off / BlockSize
+
+	if bIdxInt >= int64(len(s.Blocks)) {
+		return errors.New("stripe capacity exceeded")
+	}
+
+	innerOff := off % BlockSize
+
+	s.Blocks[bIdxInt][innerOff] = b
+	if newEnd := uint32(off - BlockSize + 1); newEnd > s.DataLen {
+		s.updateDataLen(newEnd)
+	}
+	return nil
 }
 
 type Viewer struct {

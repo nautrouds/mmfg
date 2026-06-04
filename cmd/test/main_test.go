@@ -261,8 +261,10 @@ func testBasic(t *testing.T, h *hub.Hub) {
 	}
 	defer conn.Close()
 
-	input := "hello mmfg"
-	conn.Write([]byte(input))
+	input := []byte("hello mmfg")
+	for _, b := range input {
+		conn.WriteByte(b)
+	}
 
 	if err := conn.Next("NodeA"); err != nil {
 		t.Fatalf("Next(NodeA) failed: %v", err)
