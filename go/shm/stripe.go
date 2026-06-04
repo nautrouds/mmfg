@@ -95,6 +95,14 @@ func (s *Stripe) WriteAt(p []byte, off int64) (n int, err error) {
 		return 0, errors.New("negative offset")
 	}
 
+	defer func() {
+		if n > 0 {
+			if newEnd := uint32(off - BlockSize); newEnd > s.DataLen {
+				s.updateDataLen(newEnd)
+			}
+		}
+	}()
+
 	off += BlockSize // Skip Header Block
 
 	remaining := len(p)
@@ -114,11 +122,6 @@ func (s *Stripe) WriteAt(p []byte, off int64) (n int, err error) {
 		n += copyLen
 		off += int64(copyLen)
 		remaining -= copyLen
-	}
-
-	newEnd := uint32(off - BlockSize) // Actual data end offset
-	if newEnd > s.DataLen {
-		s.updateDataLen(newEnd)
 	}
 
 	return n, nil
