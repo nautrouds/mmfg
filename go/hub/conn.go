@@ -51,6 +51,7 @@ type Connection interface {
 	Next(nodeName string) error
 	WriteTo(w io.Writer) (int64, error)
 	Close()
+	View(offset, length int, call func(*shm.Viewer) error) error
 }
 
 type busConn struct {
@@ -68,6 +69,10 @@ type busConn struct {
 
 func (c *busConn) DataLen() uint32 {
 	return c.Stripe.DataLen
+}
+
+func (c *busConn) View(offset, length int, call func(*shm.Viewer) error) error {
+	return c.Stripe.View(offset, length, call)
 }
 
 func (c *busConn) ensureCapacity(needed int) error {

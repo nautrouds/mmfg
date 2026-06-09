@@ -28,6 +28,7 @@ type Connection interface {
 	DataLen() uint32
 	RequestExpand() error
 	OnExpandComplete()
+	View(offset, length int, call func(*shm.Viewer) error) error
 }
 
 type Handler func(conn Connection)
@@ -305,6 +306,10 @@ func (n *Node) getChunk(cid int16) *shm.Chunk {
 		n.mu.RUnlock()
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func (c *nodeConn) View(offset, length int, call func(*shm.Viewer) error) error {
+	return c.stripe.View(offset, length, call)
 }
 
 func (c *nodeConn) ReadByte() (byte, error) {
