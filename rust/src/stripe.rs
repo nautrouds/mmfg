@@ -107,66 +107,14 @@ impl Stripe {
         }
     }
 
-    pub fn read_data(&mut self, offset: usize, buffer: &mut [u8]) -> usize {
-        let _ = self.refresh_sequence();
-        let seq = Arc::clone(&self.sequence);
-        if seq.is_empty() { return 0; }
-
-        let mut remaining = buffer.len();
-        let mut buf_ptr = buffer.as_mut_ptr();
-        
-        let mut off_in_stripe = offset + layout::BLOCK_SIZE; // Skip Header Block
-        let state = self.state.lock();
-
-        let mut current_cid = -1i16;
-        for &val in seq.iter() {
-            if val < 0 {
-                current_cid = val;
-                continue;
-            }
-            
-            // It's a block index
-            if off_in_stripe >= layout::BLOCK_SIZE {
-                off_in_stripe -= layout::BLOCK_SIZE;
-                continue;
-            }
-
-            // This block contains part of our data
-            let chunk_idx = !current_cid as usize;
-            if let Some(chunk) = state.chunks.get(chunk_idx) {
-                let take = std::cmp::min(remaining, layout::BLOCK_SIZE - off_in_stripe);
-                unsafe {
-                    let src = chunk.as_ptr().add((val as usize * layout::BLOCK_SIZE) + off_in_stripe);
-                    std::ptr::copy_nonoverlapping(src, buf_ptr, take);
-                    buf_ptr = buf_ptr.add(take);
-                }
-                remaining -= take;
-                off_in_stripe = 0;
-            }
-
-            if remaining == 0 { break; }
+    fn resolve_segments(&self, seq: &[i16], start_off_in_stripe: usize, want: usize) -> Vec<(*mut u8, usize)> {
+        if seq.is_empty() || want == 0 {
+            return Vec::new();
         }
 
-        buffer.len() - remaining
-    }
-
-    pub fn view<F: FnMut(&mut Viewer) -> Result<()>>(&mut self, offset: usize, length: usize, mut call: F) -> Result<()> {
-        let _ = self.refresh_sequence();
-        let seq = Arc::clone(&self.sequence);
-
-        if seq.is_empty() || offset >= self.data_len as usize {
-            return Err(MmfgError::Shm("view offset out of bounds".to_string()));
-        }
-
-        let end = std::cmp::min((offset + length) as u32, self.data_len) as usize;
-        if end <= offset {
-            return Err(MmfgError::Shm("empty view range".to_string()));
-        }
-        let actual_len = end - offset;
-
-        let mut off_in_stripe = offset + layout::BLOCK_SIZE;
-        let mut remaining = actual_len;
-        let mut segments: Vec<&mut [u8]> = Vec::new();
+        let mut off_in_stripe = start_off_in_stripe;
+        let mut remaining = want;
+        let mut out = Vec::new();
 
         let mut state = self.state.lock();
         let mut current_cid = -1i16;
@@ -187,7 +135,7 @@ impl Stripe {
                 let take = std::cmp::min(remaining, layout::BLOCK_SIZE - off_in_stripe);
                 unsafe {
                     let ptr = chunk.as_mut_ptr().add((val as usize * layout::BLOCK_SIZE) + off_in_stripe);
-                    segments.push(std::slice::from_raw_parts_mut(ptr, take));
+                    out.push((ptr, take));
                 }
                 remaining -= take;
                 off_in_stripe = 0;
@@ -195,11 +143,50 @@ impl Stripe {
 
             if remaining == 0 { break; }
         }
-        drop(state);
 
-        if segments.is_empty() {
+        out
+    }
+
+    pub fn read_data(&mut self, offset: usize, buffer: &mut [u8]) -> usize {
+        let _ = self.refresh_sequence();
+        let seq = Arc::clone(&self.sequence);
+        let segments = self.resolve_segments(&seq, offset + layout::BLOCK_SIZE, buffer.len());
+
+        let mut buf_ptr = buffer.as_mut_ptr();
+        let mut copied = 0usize;
+        for (src, len) in segments {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src as *const u8, buf_ptr, len);
+                buf_ptr = buf_ptr.add(len);
+            }
+            copied += len;
+        }
+        copied
+    }
+
+    pub fn view<F: FnMut(&mut Viewer) -> Result<()>>(&mut self, offset: usize, length: usize, mut call: F) -> Result<()> {
+        let _ = self.refresh_sequence();
+        let seq = Arc::clone(&self.sequence);
+
+        if seq.is_empty() || offset >= self.data_len as usize {
+            return Err(MmfgError::Shm("view offset out of bounds".to_string()));
+        }
+
+        let end = std::cmp::min((offset + length) as u32, self.data_len) as usize;
+        if end <= offset {
+            return Err(MmfgError::Shm("empty view range".to_string()));
+        }
+        let actual_len = end - offset;
+
+        let raw = self.resolve_segments(&seq, offset + layout::BLOCK_SIZE, actual_len);
+        if raw.is_empty() {
             return Err(MmfgError::Shm("view produced no segments".to_string()));
         }
+
+        let segments: Vec<&mut [u8]> = raw
+            .into_iter()
+            .map(|(ptr, len)| unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+            .collect();
 
         let mut offsets = Vec::with_capacity(segments.len());
         let mut curr = 0usize;
@@ -215,42 +202,18 @@ impl Stripe {
     pub fn write_data(&mut self, offset: usize, buffer: &[u8]) -> usize {
         let _ = self.refresh_sequence();
         let seq = Arc::clone(&self.sequence);
-        if seq.is_empty() { return 0; }
+        let segments = self.resolve_segments(&seq, offset + layout::BLOCK_SIZE, buffer.len());
 
-        let mut remaining = buffer.len();
         let mut buf_ptr = buffer.as_ptr();
-        
-        let mut off_in_stripe = offset + layout::BLOCK_SIZE; // Skip Header Block
-        let state = self.state.lock();
-
-        let mut current_cid = -1i16;
-        for &val in seq.iter() {
-            if val < 0 {
-                current_cid = val;
-                continue;
+        let mut copied = 0usize;
+        for (dest, len) in segments {
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf_ptr, dest, len);
+                buf_ptr = buf_ptr.add(len);
             }
-            
-            if off_in_stripe >= layout::BLOCK_SIZE {
-                off_in_stripe -= layout::BLOCK_SIZE;
-                continue;
-            }
-
-            let chunk_idx = !current_cid as usize;
-            if let Some(chunk) = state.chunks.get(chunk_idx) {
-                let take = std::cmp::min(remaining, layout::BLOCK_SIZE - off_in_stripe);
-                unsafe {
-                    let dest = chunk.as_ptr().add((val as usize * layout::BLOCK_SIZE) + off_in_stripe) as *mut u8;
-                    std::ptr::copy_nonoverlapping(buf_ptr, dest, take);
-                    buf_ptr = buf_ptr.add(take);
-                }
-                remaining -= take;
-                off_in_stripe = 0;
-            }
-
-            if remaining == 0 { break; }
+            copied += len;
         }
-
-        buffer.len() - remaining
+        copied
     }
 }
 
