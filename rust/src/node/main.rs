@@ -19,6 +19,9 @@ async fn main() -> Result<()> {
             let mut buf = Vec::new();
             // ShmConnection needs some data to read from, but here we just read whatever is in the stripe
             if let Ok(_) = conn.read_to_end(&mut buf).await {
+                if buf == b"__MMFG_TEST_PANIC__" {
+                    panic!("integration test triggered panic");
+                }
                 println!("Node received: {} bytes", buf.len());
                 // Echo handler
                 let _ = conn.write_all(&buf).await;
