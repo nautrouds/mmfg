@@ -40,6 +40,25 @@ type NodeInfo struct {
 	nodeID int
 	conn   *net.UnixConn
 	nodeEv *mmfg_sync.Eventfd
+
+	evMu   sync.RWMutex
+	closed bool
+}
+
+func (n *NodeInfo) notify() error {
+	n.evMu.RLock()
+	defer n.evMu.RUnlock()
+	if n.closed {
+		return fmt.Errorf("node closed")
+	}
+	return n.nodeEv.Notify()
+}
+
+func (n *NodeInfo) closeEventfd() error {
+	n.evMu.Lock()
+	defer n.evMu.Unlock()
+	n.closed = true
+	return n.nodeEv.Close()
 }
 
 func (h *Hub) allocNodeID() (int, error) {
@@ -141,7 +160,7 @@ func (h *Hub) submit(node *NodeInfo, slotID uint32) error {
 		return fmt.Errorf("request queue full")
 	}
 
-	return node.nodeEv.Notify()
+	return node.notify()
 }
 
 func (h *Hub) dispatchLoop() error {
@@ -248,7 +267,7 @@ func (h *Hub) watchdog(name string, node *NodeInfo) {
 			delete(h.nodes, name)
 			h.mu.Unlock()
 			node.conn.Close()
-			node.nodeEv.Close()
+			node.closeEventfd()
 			return
 		}
 	}
@@ -341,11 +360,16 @@ func (h *Hub) expandResponse(nodeID int, slotID uint32, cmd uint32) {
 	h.ctrl.Push(reqQOff, slotID, cmd)
 
 	h.mu.RLock()
+	var target *NodeInfo
 	for _, n := range h.nodes {
 		if n.nodeID == nodeID {
-			n.nodeEv.Notify()
+			target = n
 			break
 		}
 	}
 	h.mu.RUnlock()
+
+	if target != nil {
+		target.notify()
+	}
 }
