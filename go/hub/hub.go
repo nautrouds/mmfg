@@ -7,6 +7,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nautrouds/mmfg/v2/go/shm"
 	mmfg_sync "github.com/nautrouds/mmfg/v2/go/sync"
@@ -59,6 +60,12 @@ func (n *NodeInfo) closeEventfd() error {
 	defer n.evMu.Unlock()
 	n.closed = true
 	return n.nodeEv.Close()
+}
+
+func (n *NodeInfo) isClosed() bool {
+	n.evMu.RLock()
+	defer n.evMu.RUnlock()
+	return n.closed
 }
 
 func (h *Hub) allocNodeID() (int, error) {
@@ -153,13 +160,21 @@ func (h *Hub) allocSlot(stripe *shm.Stripe) (uint32, error) {
 	return slotID, nil
 }
 
-func (h *Hub) submit(node *NodeInfo, slotID uint32) error {
+func (h *Hub) pushToNode(node *NodeInfo, slotID uint32, cmd uint32) error {
 	reqQOff := shm.GetNodeReqQueueOffset(node.nodeID)
-
-	if !h.ctrl.Push(reqQOff, slotID, shm.CMD_PROCESS) {
-		return fmt.Errorf("request queue full")
+	for !h.ctrl.Push(reqQOff, slotID, cmd) {
+		if node.isClosed() {
+			return fmt.Errorf("node disconnected while request queue full")
+		}
+		time.Sleep(time.Millisecond)
 	}
+	return nil
+}
 
+func (h *Hub) submit(node *NodeInfo, slotID uint32) error {
+	if err := h.pushToNode(node, slotID, shm.CMD_PROCESS); err != nil {
+		return err
+	}
 	return node.notify()
 }
 
@@ -356,9 +371,6 @@ func (h *Hub) handleExpandRequest(nodeID int, slotID uint32) {
 }
 
 func (h *Hub) expandResponse(nodeID int, slotID uint32, cmd uint32) {
-	reqQOff := shm.GetNodeReqQueueOffset(nodeID)
-	h.ctrl.Push(reqQOff, slotID, cmd)
-
 	h.mu.RLock()
 	var target *NodeInfo
 	for _, n := range h.nodes {
@@ -369,7 +381,13 @@ func (h *Hub) expandResponse(nodeID int, slotID uint32, cmd uint32) {
 	}
 	h.mu.RUnlock()
 
-	if target != nil {
-		target.notify()
+	if target == nil {
+		return
 	}
+
+	if err := h.pushToNode(target, slotID, cmd); err != nil {
+		return
+	}
+
+	target.notify()
 }
